@@ -1,0 +1,126 @@
+# Save as: .github/workflows/raspberry-pi-build.yml
+#
+# Cross-compiles the Linux kernel for the Raspberry Pi 4 Model B (64-bit) on
+# x86-64 runners, using the .config committed to this repository.
+#
+# Works for two repository layouts:
+#   1. A kernel tree (for example a fork of raspberrypi/linux) with .config
+#      committed at its root. The kernel is built in place.
+#   2. A repository that only holds the .config. The Raspberry Pi kernel
+#      source is cloned from KERNEL_REPO / KERNEL_BRANCH.
+
+name: Raspberry Pi 4B kernel build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Path of the existing kernel config, relative to the repository root.
+  CONFIG_FILE: .config
+  # Only used when this repository is not itself a kernel tree.
+  KERNEL_REPO: https://github.com/raspberrypi/linux.git
+  KERNEL_BRANCH: rpi-6.18.y
+  # Picked up by the kernel Makefile.
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+
+jobs:
+  build:
+    name: Pi 4B kernel (arm64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Install cross toolchain and kernel build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex kmod cpio rsync file \
+            libssl-dev libelf-dev libncurses-dev \
+            gcc-aarch64-linux-gnu
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Locate kernel source
+        run: |
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::Kernel config '$CONFIG_FILE' not found in the repository"
+            exit 1
+          fi
+          if [ -f Kconfig ] && [ -d arch/arm64 ]; then
+            echo "Repository is a kernel tree, building in place"
+            KSRC="$GITHUB_WORKSPACE"
+          else
+            echo "Cloning $KERNEL_REPO ($KERNEL_BRANCH)"
+            git clone --depth=1 --branch "$KERNEL_BRANCH" "$KERNEL_REPO" linux
+            KSRC="$GITHUB_WORKSPACE/linux"
+          fi
+          echo "KSRC=$KSRC" >> "$GITHUB_ENV"
+
+      - name: Apply existing .config
+        working-directory: ${{ env.KSRC }}
+        run: |
+          SRC_CONFIG="$GITHUB_WORKSPACE/$CONFIG_FILE"
+          if [ "$(realpath "$SRC_CONFIG")" != "$(realpath -m .config)" ]; then
+            cp "$SRC_CONFIG" .config
+          fi
+          # Keeps every option you set and fills in defaults for any options
+          # that are new in this kernel version, without prompting.
+          make olddefconfig
+          grep -q '^CONFIG_ARM64=y' .config || {
+            echo "::error::The supplied config is not an arm64 kernel config"
+            exit 1
+          }
+          echo "KERNEL_RELEASE=$(make -s kernelrelease)" >> "$GITHUB_ENV"
+
+      - name: Build kernel, modules and device trees
+        working-directory: ${{ env.KSRC }}
+        run: make -j"$(nproc)" Image.gz modules dtbs
+
+      - name: Stage boot files and modules
+        working-directory: ${{ env.KSRC }}
+        run: |
+          DIST="$GITHUB_WORKSPACE/dist"
+          mkdir -p "$DIST/boot/overlays" "$DIST/rootfs"
+
+          # Kernel image. The Pi 4B firmware loads kernel8.img in 64-bit mode.
+          cp arch/arm64/boot/Image.gz "$DIST/boot/kernel8.img"
+
+          # Device tree for the Pi 4B, plus overlays if this tree has them.
+          cp arch/arm64/boot/dts/broadcom/bcm2711-rpi-4-b.dtb "$DIST/boot/"
+          if [ -d arch/arm64/boot/dts/overlays ]; then
+            cp arch/arm64/boot/dts/overlays/*.dtb* "$DIST/boot/overlays/" 2>/dev/null || true
+            cp arch/arm64/boot/dts/overlays/README "$DIST/boot/overlays/" 2>/dev/null || true
+          fi
+
+          # Modules, installed under rootfs/lib/modules/<release>.
+          make INSTALL_MOD_PATH="$DIST/rootfs" INSTALL_MOD_STRIP=1 modules_install
+          rm -f "$DIST"/rootfs/lib/modules/*/build "$DIST"/rootfs/lib/modules/*/source
+
+          # The config that was actually built.
+          cp .config "$DIST/config-$KERNEL_RELEASE"
+
+          file arch/arm64/boot/Image
+          echo "Built kernel release: $KERNEL_RELEASE"
+
+      - name: Package
+        run: tar -C dist -czf rpi4b-kernel-arm64.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rpi4b-kernel-${{ env.KERNEL_RELEASE }}
+          path: rpi4b-kernel-arm64.tar.gz
+          if-no-files-found: error
